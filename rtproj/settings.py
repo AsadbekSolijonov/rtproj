@@ -71,7 +71,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'rtproj.wsgi.application'
-ASGI_APPLICATION = 'rtproj.wsgi.application'
+ASGI_APPLICATION = 'rtproj.asgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/2.0/ref/settings/#databases
