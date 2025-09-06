@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Django Chat (DRF + WS)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>
+        body {
+            font-family: sans-serif;
+            max-width: 720px;
+            margin: 2rem auto;
+        }
+
+        #log {
+            border: 1px solid #ddd;
+            padding: 1rem;
+            height: 340px;
+            overflow: auto;
+        }
+
+        #row {
+            display: flex;
+            gap: .5rem;
+            margin-top: .75rem;
+        }
+
+        #msg {
+            flex: 1;
+            padding: .5rem;
+        }
+
+        #send {
+            padding: .5rem 1rem;
+        }
+
+        .sys {
+            color: #777;
+            font-size: 12px;
+            margin: .25rem 0;
+        }
+
+        .me {
+            text-align: right;
+        }
+
+        .msg {
+            margin: .25rem 0;
+        }
+
+        .meta {
+            font-size: 12px;
+            color: #666;
+            margin-left: .25rem;
+        }
+    </style>
+</head>
+<body>
+<h1>Messages</h1>
+<div id="log"></div>
+
+<div id="row">
+    <input id="msg" placeholder="Your message"/>
+    <button id="send">Send</button>
+</div>
+
+<script>
+    // -------------- Helpers --------------
+    const $log = document.getElementById('log');
+
+    const state = {
+        selfUser: null,            // whoami'dan keladi
+        itemsById: new Map(),      // id -> {id, user, text, mine, delivered}
+        orderedIds: []             // ko'rinish tartibi
+    };
+
+    function scrollToBottom() {
+        $log.scrollTop = $log.scrollHeight;
+    }
+
+    function sysline(text) {
+        const p = document.createElement('div');
+        p.className = 'sys';
+        p.textContent = text;
+        $log.appendChild(p);
+        scrollToBottom();
+    }
+
+    function renderOne(item) {
+        // Agar DOMda bor bo'lsa, yangilaymiz; bo'lmasa qo'shamiz
+        let node = document.querySelector(`[data-mid="${item.id}"]`);
+        const label = item.mine ? 'You' : (item.user ?? '(unknown)');
+        const meta = item.delivered ? '✓ sent' : '… sending';
+        const text = `${label}: ${item.text}`;
+
+        if (!node) {
+            node = document.createElement('div');
+            node.className = 'msg' + (item.mine ? ' me' : '');
+            node.dataset.mid = item.id;
+            node.innerHTML = `<span class="txt"></span><span class="meta"></span>`;
+            $log.appendChild(node);
+        } else {
+            node.className = 'msg' + (item.mine ? ' me' : '');
+        }
+
+        node.querySelector('.txt').textContent = text;
+        node.querySelector('.meta').textContent = ' ' + meta;
+    }
+
+    function upsertMessage({id, user, text, mine = false, delivered = false}) {
+        if (!id) return; // xavfsizlik
+        const prev = state.itemsById.get(id) || {};
+        const next = {
+            id,
+            user: user ?? prev.user,
+            text: text ?? prev.text,
+            mine: (typeof mine === 'boolean') ? mine : !!prev.mine,
+            delivered: (typeof delivered === 'boolean') ? delivered : !!prev.delivered,
+        };
+        state.itemsById.set(id, next);
+        if (!state.orderedIds.includes(id)) state.orderedIds.push(id);
+        renderOne(next);
+    }
+
+    // -------------- REST: oldingi xabarlar --------------
+    fetch('/api/messages/', {credentials: 'same-origin'})
+        .then(r => r.json())
+        .then(items => {
+            if (!Array.isArray(items)) {
+                sysline('[REST] bad JSON');
+                return;
+            }
+            items.forEach(m => {
+                upsertMessage({
+                    id: m.id,
+                    user: m.username ?? m.user ?? m.user_id,
+                    text: m.text,
+                    mine: false,
+                    delivered: true
+                });
+            });
+        })
+        .catch(e => sysline(`[REST error] ${e}`));
+
+    // -------------- WebSocket --------------
+    const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsScheme}://${location.host}/ws/messages/`;
+    const whoReqId = `who-${Date.now()}`;
+
+    let socket;
+
+    function connect() {
+        socket = new WebSocket(wsUrl);
+
+        const sendJson = (obj) => {
+            if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(obj));
+            else sysline('[WS] not open, cannot send');
+        };
+        window._sendJson = sendJson;
+
+        socket.onopen = () => {
+            sysline('WS connected');
+            sendJson({action: 'whoami', request_id: whoReqId});
+            sendJson({action: 'subscribe_to_message_activity', request_id: 'sub-1'});
+        };
+
+        socket.onmessage = (event) => {
+            let p;
+            try {
+                p = JSON.parse(event.data);
+            } catch {
+                sysline(`[WS-raw] ${event.data}`);
+                return;
+            }
+
+            // whoami → self username
+            if (p.action === 'whoami') {
+                if (p.request_id === whoReqId) {
+                    state.selfUser = p.username || null;
+                    sysline(`[whoami] auth=${p.is_authenticated} user=${state.selfUser ?? 'None'}`);
+                }
+                return;
+            }
+
+            // subscribe ack
+            if (p.action === 'subscribe_to_message_activity' && p.status === 'subscribed') {
+                sysline('[WS] subscribed to message_activity');
+                return;
+            }
+
+            // Xabar payloadlari
+            if (p.data && p.data.text) {
+                const id = p.data.id;
+                const user = p.data.username ?? p.data.user ?? p.data.user_id;
+                const text = p.data.text;
+
+                // 1) ACK (action === 'send_message') → faqat jo'natuvchiga keladi
+                if (p.action === 'send_message') {
+                    const mine = (state.selfUser && user === state.selfUser);
+                    upsertMessage({id, user, text, mine: !!mine, delivered: false});
+                    return;
+                }
+
+                // 2) Observer eventlari (create/update/delete) → barcha abonentlarga
+                if (p.action === 'create' || p.action === 'update') {
+                    // Agar shu xabar avval "You … sending" sifatida bo'lsa → delivered=true qilib yangilaymiz
+                    const mine = (state.selfUser && user === state.selfUser);
+                    upsertMessage({id, user, text, mine: !!mine, delivered: true});
+                    return;
+                }
+
+                // Noma'lum/ fallback xolatlar
+                const mine = (state.selfUser && user === state.selfUser);
+                upsertMessage({id, user, text, mine: !!mine, delivered: true});
+                return;
+            }
+
+            // Xatolar
+            if (p.errors) {
+                const msg = Array.isArray(p.errors) && p.errors.length ? JSON.stringify(p.errors) : '(empty errors)';
+                sysline(`[WS error] ${msg}`);
+                return;
+            }
+
+            sysline(`[WS] ${event.data}`);
+        };
+
+        socket.onerror = () => sysline('[WS] error (see server logs)');
+        socket.onclose = (evt) => {
+            sysline(`WS closed (code=${evt.code}) — reconnecting...`);
+            setTimeout(connect, 1000);
+        };
+    }
+
+    connect();
+
+    // -------------- Send --------------
+    const $input = document.getElementById('msg');
+    const $send = document.getElementById('send');
+
+    function sendMessage() {
+        const text = $input.value.trim();
+        if (!text) return;
+        if (window._sendJson) {
+            window._sendJson({
+                action: 'send_message',
+                request_id: `req-${Date.now()}`,
+                data: {text}
+            });
+            $input.value = '';
+        } else {
+            sysline('[WS] not open, cannot send');
+        }
+    }
+
+    // Tugma bosilganda
+    $send.onclick = sendMessage;
+
+    // ENTER bosilganda
+    $input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();   // ehtiyot uchun: form bo'lsa submit bo'lmasin
+            sendMessage();
+        }
+    });
+</script>
+
+</body>
+</html>
